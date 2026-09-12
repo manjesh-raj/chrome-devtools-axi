@@ -41,7 +41,6 @@ describe("main CLI runtime", () => {
     expect(TOP_HELP).toContain("--help");
     expect(TOP_HELP).toContain("-v/-V/--version");
   });
-
   it("documents explicit hook setup in help output", () => {
     expect(TOP_HELP).toContain("setup hooks");
     expect(TOP_HELP).not.toContain("CHROME_DEVTOOLS_AXI_DISABLE_HOOKS");

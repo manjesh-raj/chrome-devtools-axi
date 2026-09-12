@@ -1,4 +1,5 @@
 import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
+import { execFileSync } from "node:child_process";
 import { IncomingMessage, ServerResponse, request } from "node:http";
 import { Socket, type AddressInfo } from "node:net";
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -7,8 +8,10 @@ import { join, resolve } from "node:path";
 import {
   BRIDGE_PORT_IN_USE_EXIT_CODE,
   buildTransportArgs,
+  closeBridgeTransport,
   createBridgeServer,
   createRootsAwareBridgeClient,
+  createTransport,
   detectGlobalMcpPath,
   didMcpPageIdentityChange,
   extractHostHeaderHostname,
@@ -26,6 +29,7 @@ import {
   parseBridgeCallPayload,
   removePidFile,
   resolveBridgeScript,
+  resolveTransport,
   resolveTransportSpec,
   type BridgeClient,
 } from "../src/bridge.js";
@@ -430,6 +434,10 @@ describe("resolveTransportSpec", () => {
   beforeEach(() => {
     savedEnv.CHROME_DEVTOOLS_AXI_MCP_PATH =
       process.env.CHROME_DEVTOOLS_AXI_MCP_PATH;
+    savedEnv.CHROME_DEVTOOLS_AXI_MCP_SERVER_URL =
+      process.env.CHROME_DEVTOOLS_AXI_MCP_SERVER_URL;
+    savedEnv.CHROME_DEVTOOLS_AXI_WS_HEADERS =
+      process.env.CHROME_DEVTOOLS_AXI_WS_HEADERS;
     savedEnv.CHROME_DEVTOOLS_AXI_HEADED =
       process.env.CHROME_DEVTOOLS_AXI_HEADED;
     savedEnv.CHROME_DEVTOOLS_AXI_BROWSER_URL =
@@ -439,6 +447,8 @@ describe("resolveTransportSpec", () => {
     savedEnv.CHROME_DEVTOOLS_AXI_AUTO_CONNECT =
       process.env.CHROME_DEVTOOLS_AXI_AUTO_CONNECT;
     delete process.env.CHROME_DEVTOOLS_AXI_MCP_PATH;
+    delete process.env.CHROME_DEVTOOLS_AXI_MCP_SERVER_URL;
+    delete process.env.CHROME_DEVTOOLS_AXI_WS_HEADERS;
     delete process.env.CHROME_DEVTOOLS_AXI_HEADED;
     delete process.env.CHROME_DEVTOOLS_AXI_BROWSER_URL;
     delete process.env.CHROME_DEVTOOLS_AXI_USER_DATA_DIR;
@@ -482,6 +492,91 @@ describe("resolveTransportSpec", () => {
     expect(spec.args).toContain("--headless");
   });
 
+  describe("shared MCP service", () => {
+    let dir: string;
+
+    beforeEach(() => {
+      dir = mkdtempSync(join(tmpdir(), "cdp-shared-mcp-"));
+      process.env.CHROME_DEVTOOLS_AXI_MCP_PATH = join(dir, "mcp.cjs");
+      process.env.CHROME_DEVTOOLS_AXI_MCP_SERVER_URL =
+        " http://127.0.0.1:9333/mcp ";
+    });
+
+    afterEach(() => {
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    function writeExecutable(help: string): void {
+      writeFileSync(
+        process.env.CHROME_DEVTOOLS_AXI_MCP_PATH!,
+        `if (process.argv.includes("--help")) {
+  process.stdout.write(${JSON.stringify(help)});
+} else {
+  process.stdout.write(JSON.stringify(process.argv.slice(2)));
+}`,
+      );
+    }
+
+    it("passes only the shared server URL to the selected executable", () => {
+      writeExecutable("Options:\n  --serverUrl  Use an HTTP server [string]\n");
+      process.env.CHROME_DEVTOOLS_AXI_BROWSER_URL =
+        "ws://127.0.0.1:9222/devtools/browser/local";
+      process.env.CHROME_DEVTOOLS_AXI_WS_HEADERS = "invalid local setting";
+      process.env.CHROME_DEVTOOLS_AXI_USER_DATA_DIR = "/local/profile";
+
+      const spec = resolveTransportSpec();
+      const output = execFileSync(spec.command, spec.args, {
+        encoding: "utf8",
+      });
+
+      expect(JSON.parse(output)).toEqual([
+        "--server-url=http://127.0.0.1:9333/mcp",
+      ]);
+    });
+
+    it.each([undefined, "", "   "])(
+      "requires an explicit executable instead of auto-detection (%s)",
+      (path) => {
+        if (path === undefined) delete process.env.CHROME_DEVTOOLS_AXI_MCP_PATH;
+        else process.env.CHROME_DEVTOOLS_AXI_MCP_PATH = path;
+        const probe = {
+          existsSync: vi.fn(() => true),
+          getNpmPrefix: vi.fn(() => "/usr"),
+        };
+
+        expect(() => resolveTransportSpec(probe)).toThrow(
+          "requires CHROME_DEVTOOLS_AXI_MCP_PATH",
+        );
+        expect(probe.getNpmPrefix).not.toHaveBeenCalled();
+      },
+    );
+
+    it("rejects an executable whose help lacks proxy support", () => {
+      writeExecutable("Options:\n  --browserUrl  Connect to Chrome [string]\n");
+
+      expect(() => resolveTransportSpec()).toThrow(
+        "does not advertise --serverUrl",
+      );
+    });
+
+    it("rejects an executable whose help fails", () => {
+      writeFileSync(
+        process.env.CHROME_DEVTOOLS_AXI_MCP_PATH!,
+        'process.stdout.write("  --serverUrl  HTTP proxy\\n"); process.exit(1);',
+      );
+
+      expect(() => resolveTransportSpec()).toThrow(
+        "Cannot verify --server-url proxy support",
+      );
+    });
+
+    it("rejects a missing executable", () => {
+      expect(() => resolveTransportSpec()).toThrow(
+        "Cannot verify --server-url proxy support",
+      );
+    });
+  });
+
   it("preserves --browserUrl when MCP_PATH and BROWSER_URL are both set", () => {
     process.env.CHROME_DEVTOOLS_AXI_MCP_PATH = "/opt/mcp.js";
     process.env.CHROME_DEVTOOLS_AXI_BROWSER_URL = "http://127.0.0.1:9222";
@@ -492,8 +587,8 @@ describe("resolveTransportSpec", () => {
     expect(spec.args).not.toContain("--isolated");
   });
 
-  it("treats an empty MCP_PATH as unset", () => {
-    process.env.CHROME_DEVTOOLS_AXI_MCP_PATH = "";
+  it.each(["", "   "])("treats a blank MCP_PATH as unset: %s", (mcpPath) => {
+    process.env.CHROME_DEVTOOLS_AXI_MCP_PATH = mcpPath;
     const probe = {
       existsSync: () => false,
       getNpmPrefix: () => null,
@@ -547,6 +642,187 @@ describe("resolveTransportSpec", () => {
     const spec = resolveTransportSpec(probe);
     expect(spec.command).toBe(process.execPath);
     expect(spec.args[0]).toBe("/explicit/override.js");
+  });
+});
+
+describe("resolveTransport / createTransport", () => {
+  const savedServerUrl = process.env.CHROME_DEVTOOLS_AXI_MCP_SERVER_URL;
+  const savedMcpPath = process.env.CHROME_DEVTOOLS_AXI_MCP_PATH;
+
+  beforeEach(() => {
+    delete process.env.CHROME_DEVTOOLS_AXI_MCP_SERVER_URL;
+    delete process.env.CHROME_DEVTOOLS_AXI_MCP_PATH;
+  });
+
+  afterEach(() => {
+    if (savedServerUrl === undefined) {
+      delete process.env.CHROME_DEVTOOLS_AXI_MCP_SERVER_URL;
+    } else {
+      process.env.CHROME_DEVTOOLS_AXI_MCP_SERVER_URL = savedServerUrl;
+    }
+    if (savedMcpPath === undefined) {
+      delete process.env.CHROME_DEVTOOLS_AXI_MCP_PATH;
+    } else {
+      process.env.CHROME_DEVTOOLS_AXI_MCP_PATH = savedMcpPath;
+    }
+  });
+
+  it("selects direct HTTP for a URL-only shared configuration", () => {
+    process.env.CHROME_DEVTOOLS_AXI_MCP_SERVER_URL =
+      " https://127.0.0.1:9333/mcp ";
+    const probe = {
+      existsSync: vi.fn(() => false),
+      getNpmPrefix: vi.fn(() => "/usr"),
+    };
+
+    const selection = resolveTransport(probe);
+
+    expect(selection.kind).toBe("http");
+    if (selection.kind !== "http") throw new Error("expected HTTP transport");
+    expect(selection.url.href).toBe("https://127.0.0.1:9333/mcp");
+    expect(probe.getNpmPrefix).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    "127.0.0.1:9333/mcp",
+    "ftp://127.0.0.1:9333/mcp",
+    "http://",
+    "ws://127.0.0.1:9333/mcp",
+  ])("rejects a non-absolute-http(s) shared URL: %s", (serverUrl) => {
+    process.env.CHROME_DEVTOOLS_AXI_MCP_SERVER_URL = serverUrl;
+
+    expect(() => resolveTransport()).toThrow(
+      "CHROME_DEVTOOLS_AXI_MCP_SERVER_URL must be an absolute http(s) URL",
+    );
+  });
+
+  it.each([undefined, "", "   "])(
+    "keeps blank shared URLs on the standalone stdio path (%s)",
+    (serverUrl) => {
+      if (serverUrl === undefined) {
+        delete process.env.CHROME_DEVTOOLS_AXI_MCP_SERVER_URL;
+      } else {
+        process.env.CHROME_DEVTOOLS_AXI_MCP_SERVER_URL = serverUrl;
+      }
+      const selection = resolveTransport({
+        existsSync: () => false,
+        getNpmPrefix: () => "/usr",
+      });
+
+      expect(selection.kind).toBe("stdio");
+      if (selection.kind !== "stdio") {
+        throw new Error("expected stdio transport");
+      }
+      expect(selection.spec.command).toBe("npx");
+      expect(selection.spec.args.slice(0, 2)).toEqual([
+        "-y",
+        "chrome-devtools-mcp@latest",
+      ]);
+    },
+  );
+
+  it("keeps URL plus MCP_PATH on the verified stdio proxy path", () => {
+    const dir = mkdtempSync(join(tmpdir(), "cdp-transport-selection-"));
+    const mcpPath = join(dir, "mcp.cjs");
+    process.env.CHROME_DEVTOOLS_AXI_MCP_SERVER_URL =
+      "http://127.0.0.1:9333/mcp";
+    process.env.CHROME_DEVTOOLS_AXI_MCP_PATH = mcpPath;
+    writeFileSync(
+      mcpPath,
+      'if (process.argv.includes("--help")) process.stdout.write(["Options:", "  --serverUrl  proxy", ""].join(String.fromCharCode(10)));',
+    );
+
+    try {
+      const selection = resolveTransport();
+
+      expect(selection.kind).toBe("stdio");
+      if (selection.kind !== "stdio") {
+        throw new Error("expected stdio proxy transport");
+      }
+      expect(selection.spec.command).toBe(process.execPath);
+      expect(selection.spec.args).toEqual([
+        mcpPath,
+        "--server-url=http://127.0.0.1:9333/mcp",
+      ]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("constructs direct HTTP without invoking the stdio factory", () => {
+    process.env.CHROME_DEVTOOLS_AXI_MCP_SERVER_URL =
+      "http://127.0.0.1:9333/mcp";
+    const direct = {
+      start: async () => {},
+      send: async () => {},
+      close: vi.fn(async () => {}),
+      terminateSession: vi.fn(async () => {}),
+    };
+    const createStdio = vi.fn(() => {
+      throw new Error("stdio factory should not be called");
+    });
+    const createHttp = vi.fn(() => direct);
+
+    const bridgeTransport = createTransport(resolveTransport(), {
+      createStdio,
+      createHttp,
+    });
+
+    expect(createStdio).not.toHaveBeenCalled();
+    expect(createHttp).toHaveBeenCalledTimes(1);
+    expect(bridgeTransport.transport).toBe(direct);
+    expect(bridgeTransport.terminateSession).toBeDefined();
+  });
+
+  it("terminates a direct session before closing its transport", async () => {
+    const events: string[] = [];
+    const direct = {
+      start: async () => {},
+      send: async () => {},
+      close: async () => {
+        events.push("close");
+      },
+      terminateSession: async () => {
+        events.push("terminate");
+      },
+    };
+    const bridgeTransport = createTransport(
+      { kind: "http", url: new URL("http://127.0.0.1:9333/mcp") },
+      {
+        createStdio: () => {
+          throw new Error("stdio factory should not be called");
+        },
+        createHttp: () => direct,
+      },
+    );
+
+    await closeBridgeTransport(bridgeTransport);
+
+    expect(events).toEqual(["terminate", "close"]);
+  });
+
+  it("closes stdio without attempting remote session termination", async () => {
+    const events: string[] = [];
+    const stdio = {
+      start: async () => {},
+      send: async () => {},
+      close: async () => {
+        events.push("close");
+      },
+    };
+    const bridgeTransport = createTransport(
+      { kind: "stdio", spec: { command: "node", args: [] } },
+      {
+        createStdio: () => stdio,
+        createHttp: () => {
+          throw new Error("HTTP factory should not be called");
+        },
+      },
+    );
+
+    await closeBridgeTransport(bridgeTransport);
+
+    expect(events).toEqual(["close"]);
   });
 });
 
